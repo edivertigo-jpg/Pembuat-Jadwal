@@ -338,14 +338,18 @@ function analyze(rows, n, y, m, need, cfg){
       msgs.push({type:'Kebutuhan', text:`${LABELS[s]} kurang pada tgl ${list}`});
     }
   }
+  if(cfg.codes.includes('PS') && rows.length){
+    const c = rows.map(r=>stats[r.id].PS), lo=Math.min(...c), hi=Math.max(...c);
+    if(hi-lo>1) msgs.push({type:'Pemerataan', text:`PS belum merata: ${lo}–${hi} kali per perawat`});
+  }
   return {viol, msgs, stats, cover, short, filled};
 }
 
 function autoFill(rows, n, y, m, need, cfg){
   const target = Math.round(n*0.72);
   const cnt = (c,k)=>c.reduce((a,x)=>a+(x===k?1:0),0);
+  const hasM = cfg.cover.includes('M');
   const orig = rows.map(r=>r.cells.slice());
-  const order = ['M','S','P'].filter(s=>cfg.cover.includes(s));
   for(let d=0; d<n; d++){
     const req = needFor(need,y,m,d+1);
     const have = {P:0,S:0,M:0};
@@ -356,7 +360,7 @@ function autoFill(rows, n, y, m, need, cfg){
     const prev = r => d>0 ? r.cells[d-1] : '';
     const run = r => { let k=0; for(let t=d-1; t>=0 && isWork(r.cells[t]); t--) k++; return k; };
     const mrun = r => { let k=0; for(let t=d-1; t>=0 && r.cells[t]==='M'; t--) k++; return k; };
-    const allowed = (r,s) => {
+    const free = (r,s) => {
       if(r.cells[d]!=='') return false;
       if(s!=='M' && prev(r)==='M') return false;
       if(run(r)>=MAX_RUN) return false;
@@ -366,19 +370,33 @@ function autoFill(rows, n, y, m, need, cfg){
       }
       return true;
     };
-    for(const s of order){
-      let missing = (req[s]||0)-have[s];
+    const jitter = i => ((i*7+d*3)%rows.length)*0.01;
+    // 1) Malam (hanya unit yang punya Malam)
+    if(hasM){
+      let missing = (req.M||0)-have.M;
       while(missing>0){
-        const cand = rows.map((r,i)=>({r,i})).filter(o=>allowed(o.r,s));
+        const cand = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'M'));
         if(!cand.length) break;
         cand.forEach(o=>{
-          o.score = cnt(o.r.cells,s)*3 + pointsOf(o.r.cells) + ((o.i*7+d*3)%rows.length)*0.01;
-          if(s==='M' && prev(o.r)==='M' && mrun(o.r)<MAX_NIGHT) o.score -= 100;
+          o.score = cnt(o.r.cells,'M')*3 + pointsOf(o.r.cells) + jitter(o.i);
+          if(prev(o.r)==='M' && mrun(o.r)<MAX_NIGHT) o.score -= 100;
         });
         cand.sort((a,b)=>a.score-b.score);
-        cand[0].r.cells[d]=s; have[s]++; missing--;
+        cand[0].r.cells[d]='M'; have.M++; missing--;
       }
     }
+    // 2) Pagi, Sore, dan PS dari semua tenaga yang tersedia hari ini.
+    //    Bila tenaga kurang, sebagian jadi PS (satu orang menutup Pagi dan Sore).
+    //    PS jatuh ke perawat dengan jumlah PS paling sedikit supaya merata.
+    const pool = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'P'));
+    const needP = Math.max(0,(req.P||0)-have.P), needS = Math.max(0,(req.S||0)-have.S);
+    const deficit = needP + needS - pool.length;
+    const nPS = deficit>0 ? Math.min(needP,needS,deficit) : 0;
+    const take = (k,score)=>{ pool.forEach(o=>o.score=score(o)); pool.sort((p,q)=>p.score-q.score); return pool.splice(0,Math.max(0,Math.min(k,pool.length))); };
+    take(nPS,o=>cnt(o.r.cells,'PS')*10 + (prev(o.r)==='PS'?25:0) + pointsOf(o.r.cells)*0.2 + jitter(o.i)).forEach(o=>o.r.cells[d]='PS');
+    take(needS-nPS,o=>cnt(o.r.cells,'S')*3 + pointsOf(o.r.cells) + jitter(o.i)).forEach(o=>o.r.cells[d]='S');
+    take(needP-nPS,o=>cnt(o.r.cells,'P')*3 + pointsOf(o.r.cells) + jitter(o.i)).forEach(o=>o.r.cells[d]='P');
+    // 3) Sisanya: Libur, atau Pagi tambahan bila masih di bawah tempo kerja bulanan
     rows.forEach(r=>{
       if(r.cells[d]!=='') return;
       if(prev(r)==='M' || run(r)>=MAX_RUN){ r.cells[d]='L'; return; }
@@ -387,17 +405,45 @@ function autoFill(rows, n, y, m, need, cfg){
       const slack = isWeekend(y,m,d+1) ? 2 : 0;
       r.cells[d] = (worked + slack <= expected) ? 'P' : 'L';
     });
-    // Kekurangan Pagi atau Sore yang masih tersisa ditutup dengan PS (satu orang dua dinas)
-    for(const s of ['P','S']){
-      const other = s==='P' ? 'S' : 'P';
-      const count = () => rows.filter(r=>r.cells[d]===s||r.cells[d]==='PS').length;
-      while(count() < (req[s]||0)){
-        const cand = rows.map((r,i)=>({r,i})).filter(o=>orig[o.i][d]==='' && o.r.cells[d]===other && (d===0 || o.r.cells[d-1]!=='PS'));
-        if(!cand.length) break;
-        cand.sort((a,b)=>cnt(a.r.cells,'PS')-cnt(b.r.cells,'PS') || a.i-b.i);
-        cand[0].r.cells[d]='PS';
+  }
+  // 4) Ratakan jumlah PS: tukar PS milik perawat yang paling banyak dengan dinas tunggal
+  //    perawat yang paling sedikit pada hari yang sama. Jumlah orang jaga tiap dinas tetap.
+  for(let guard=0; guard<800; guard++){
+    const info = rows.map((r,i)=>({r,i,c:cnt(r.cells,'PS')}));
+    const hi = Math.max(...info.map(o=>o.c));
+    const donors = info.filter(o=>o.c===hi).sort((a,b)=>pointsOf(b.r.cells)-pointsOf(a.r.cells));
+    const takers = info.filter(o=>o.c<=hi-2).sort((a,b)=>a.c-b.c || pointsOf(a.r.cells)-pointsOf(b.r.cells));
+    let done = false;
+    for(const strict of [true,false]){
+      for(const A of donors){
+        for(const B of takers){
+          for(let d=0; d<n; d++){
+            const bc = B.r.cells[d];
+            if(A.r.cells[d]!=='PS' || orig[A.i][d]!=='' || orig[B.i][d]!=='' || (bc!=='P' && bc!=='S')) continue;
+            if(strict && (B.r.cells[d-1]==='PS' || B.r.cells[d+1]==='PS')) continue;
+            A.r.cells[d]=bc; B.r.cells[d]='PS'; done=true; break;
+          }
+          if(done) break;
+        }
+        if(done) break;
+      }
+      if(done) break;
+    }
+    if(!done){
+      // Cadangan: oper PS ke perawat yang hari itu Libur, pemilik PS sebelumnya Libur
+      const runThrough = (c,d)=>{ let l=0,r=0; for(let t=d-1;t>=0&&isWork(c[t]);t--) l++; for(let t=d+1;t<n&&isWork(c[t]);t++) r++; return l+1+r; };
+      outer: for(const A of donors){
+        for(const B of takers){
+          for(let d=0; d<n; d++){
+            if(A.r.cells[d]!=='PS' || orig[A.i][d]!=='' || orig[B.i][d]!=='' || B.r.cells[d]!=='L') continue;
+            if(d>0 && B.r.cells[d-1]==='M') continue;
+            if(runThrough(B.r.cells,d) > MAX_RUN) continue;
+            A.r.cells[d]='L'; B.r.cells[d]='PS'; done=true; break outer;
+          }
+        }
       }
     }
+    if(!done) break;
   }
   return rows;
 }
@@ -531,6 +577,7 @@ function renderPanels(){
   rules.push(`Maksimal ${MAX_RUN} hari kerja berturut-turut.`);
   if(cfg.cover.includes('M')) rules.push(`Maksimal ${MAX_NIGHT} dinas Malam berturut-turut.`);
   rules.push('Jumlah perawat tiap dinas minimal sesuai kebutuhan. PS dihitung untuk Pagi dan Sore sekaligus.');
+  rules.push('Kekurangan ditutup dengan PS dari tenaga yang ada. Jumlah PS antarperawat tidak selisih lebih dari 1 kali per bulan.');
   $('ruleslist').innerHTML=rules.map(r=>`<li>${r}</li>`).join('');
   $('nurselist').innerHTML=U().nurses.map(nu=>`<li><input class="field nm-in" data-nname="${nu.id}" value="${esc(nu.name)}" maxlength="40" aria-label="Nama perawat">
     <select class="field" data-ngrade="${nu.id}" aria-label="Jenjang ${esc(nu.name)}">${GRADES.map(g=>`<option${g===nu.grade?' selected':''}>${g}</option>`).join('')}</select>
@@ -558,7 +605,9 @@ function runAuto(mode){
   if(mode==='regen') rows.forEach(r=>r.cells=r.cells.map(c=>c==='CT'?'CT':''));
   if(mode==='clear'){ rows.forEach(r=>r.cells=r.cells.map(()=>'')); saveRows(y,m,rows); refresh(); status('Jadwal bulan ini dikosongkan.'); return; }
   autoFill(rows,n,y,m,U().need,CFG()); saveRows(y,m,rows); refresh();
-  status(A.msgs.length?`Jadwal terisi. Ada ${A.msgs.length} hal yang perlu dicek di bagian Pemeriksaan.`:'Jadwal terisi dan semua aturan terpenuhi.');
+  const lacking=['P','S','M'].some(k=>A.short[k].length);
+  status(lacking?'Jadwal terisi dan PS sudah dipakai, tetapi tenaga belum cukup untuk kebutuhan minimal di sebagian hari. Tambah perawat atau turunkan kebutuhan minimal.'
+    :A.msgs.length?`Jadwal terisi. Ada ${A.msgs.length} hal yang perlu dicek di bagian Pemeriksaan.`:'Jadwal terisi dan semua aturan terpenuhi.');
 }
 function copyTable(){
   const cfg=CFG(), {y,m}=S.view, n=daysIn(y,m), rows=rowsFor(y,m);
