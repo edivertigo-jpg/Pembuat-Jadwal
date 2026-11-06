@@ -264,12 +264,12 @@ const LABELS = {P:'Pagi', S:'Sore', PS:'Pagi + Sore', M:'Malam', L:'Libur', CT:'
 const UNITS = {
   inap:{ name:'Rawat Inap', cover:['P','S','M'], codes:['P','S','PS','M','L','CT'],
     time:{P:'07.30–13.30', S:'13.30–19.30', PS:'07.30–19.30', M:'19.30–07.30'},
-    hours:{P:6, S:6, PS:12, M:12, L:0, CT:0} },
+    hours:{P:6, S:6, PS:12, M:12, L:0, CT:0}, maxRun:5, workRatio:0.72 },
   poli:{ name:'Poliklinik', cover:['P','S'], codes:['P','S','PS','L','CT'],
     time:{P:'09.00–15.00', S:'15.00–22.00', PS:'09.00–22.00'},
-    hours:{P:6, S:7, PS:13, M:0, L:0, CT:0} }
+    hours:{P:6, S:7, PS:13, M:0, L:0, CT:0}, maxRun:6, workRatio:6/7 }
 };
-const MAX_RUN = 5, MAX_NIGHT = 3;
+const MAX_RUN = 6, MAX_NIGHT = 3;
 function daysIn(y,m){ return new Date(y,m+1,0).getDate(); }
 function isWeekend(y,m,d){ const w=new Date(y,m,d).getDay(); return w===0||w===6; } // d: 1-based
 function isWork(c){ return c==='P'||c==='S'||c==='M'||c==='PS'; }
@@ -312,7 +312,7 @@ function analyze(rows, n, y, m, need, cfg){
       if(isWork(c[i])){
         let j=i; while(j+1<n && isWork(c[j+1])) j++;
         const len=j-i+1;
-        if(len>MAX_RUN){ for(let k=i;k<=j;k++) v.add(k); msgs.push({type:'Beban', text:`${r.name}: ${len} hari kerja berturut-turut (tgl ${i+1}–${j+1})`}); }
+        if(len>cfg.maxRun){ for(let k=i;k<=j;k++) v.add(k); msgs.push({type:'Beban', text:`${r.name}: ${len} hari kerja berturut-turut (tgl ${i+1}–${j+1})`}); }
         i=j+1;
       } else i++;
     }
@@ -346,60 +346,77 @@ function analyze(rows, n, y, m, need, cfg){
 }
 
 function autoFill(rows, n, y, m, need, cfg){
-  const target = Math.round(n*0.72);
+  const target = Math.round(n*(cfg.workRatio||0.72));
   const cnt = (c,k)=>c.reduce((a,x)=>a+(x===k?1:0),0);
   const hasM = cfg.cover.includes('M');
   const orig = rows.map(r=>r.cells.slice());
+  const R = cfg.maxRun;
+  // Tahap kelonggaran: normal dulu. Bila kebutuhan masih kurang, batas hari berturut-turut
+  // dilonggarkan bertahap, dan paling akhir boleh langsung masuk setelah Malam.
+  // Pelanggaran yang terpaksa terjadi tampil merah di jadwal dan di panel Pemeriksaan.
+  const TIERS = [
+    {run:R,   night:MAX_NIGHT,   afterM:false},
+    {run:R+1, night:MAX_NIGHT+1, afterM:false},
+    {run:R+2, night:MAX_NIGHT+2, afterM:false},
+    {run:99,  night:99,          afterM:false},
+    {run:99,  night:99,          afterM:true}
+  ];
   for(let d=0; d<n; d++){
     const req = needFor(need,y,m,d+1);
-    const have = {P:0,S:0,M:0};
-    rows.forEach(r=>{
-      const x=r.cells[d];
-      if(x==='PS'){ have.P++; have.S++; } else if(have[x]!==undefined) have[x]++;
-    });
     const prev = r => d>0 ? r.cells[d-1] : '';
     const run = r => { let k=0; for(let t=d-1; t>=0 && isWork(r.cells[t]); t--) k++; return k; };
     const mrun = r => { let k=0; for(let t=d-1; t>=0 && r.cells[t]==='M'; t--) k++; return k; };
-    const free = (r,s) => {
+    const free = (r,s,t) => {
       if(r.cells[d]!=='') return false;
-      if(s!=='M' && prev(r)==='M') return false;
-      if(run(r)>=MAX_RUN) return false;
+      if(s!=='M' && prev(r)==='M' && !t.afterM) return false;
+      if(run(r)>=t.run) return false;
       if(s==='M'){
-        if(mrun(r)>=MAX_NIGHT) return false;
-        const nx=r.cells[d+1]; if(nx==='P'||nx==='S'||nx==='PS') return false;
+        if(mrun(r)>=t.night) return false;
+        const nx=r.cells[d+1]; if(!t.afterM && (nx==='P'||nx==='S'||nx==='PS')) return false;
       }
       return true;
     };
     const jitter = i => ((i*7+d*3)%rows.length)*0.01;
     // 1) Malam (hanya unit yang punya Malam)
     if(hasM){
-      let missing = (req.M||0)-have.M;
-      while(missing>0){
-        const cand = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'M'));
-        if(!cand.length) break;
-        cand.forEach(o=>{
-          o.score = cnt(o.r.cells,'M')*3 + pointsOf(o.r.cells) + jitter(o.i);
-          if(prev(o.r)==='M' && mrun(o.r)<MAX_NIGHT) o.score -= 100;
-        });
-        cand.sort((a,b)=>a.score-b.score);
-        cand[0].r.cells[d]='M'; have.M++; missing--;
+      const haveM = () => rows.filter(r=>r.cells[d]==='M').length;
+      for(let ti=0; ti<TIERS.length && haveM()<(req.M||0); ti++){
+        const t=TIERS[ti];
+        while(haveM() < (req.M||0)){
+          const cand = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'M',t));
+          if(!cand.length) break;
+          cand.forEach(o=>{
+            o.score = cnt(o.r.cells,'M')*3 + pointsOf(o.r.cells) + jitter(o.i) + (ti ? mrun(o.r)*3 + run(o.r)*2 : 0);
+            if(prev(o.r)==='M' && mrun(o.r)<MAX_NIGHT) o.score -= 100;
+          });
+          cand.sort((a,b)=>a.score-b.score);
+          cand[0].r.cells[d]='M';
+        }
       }
     }
-    // 2) Pagi, Sore, dan PS dari semua tenaga yang tersedia hari ini.
-    //    Bila tenaga kurang, sebagian jadi PS (satu orang menutup Pagi dan Sore).
-    //    PS jatuh ke perawat dengan jumlah PS paling sedikit supaya merata.
-    const pool = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'P'));
-    const needP = Math.max(0,(req.P||0)-have.P), needS = Math.max(0,(req.S||0)-have.S);
-    const deficit = needP + needS - pool.length;
-    const nPS = deficit>0 ? Math.min(needP,needS,deficit) : 0;
-    const take = (k,score)=>{ pool.forEach(o=>o.score=score(o)); pool.sort((p,q)=>p.score-q.score); return pool.splice(0,Math.max(0,Math.min(k,pool.length))); };
-    take(nPS,o=>cnt(o.r.cells,'PS')*10 + (prev(o.r)==='PS'?25:0) + pointsOf(o.r.cells)*0.2 + jitter(o.i)).forEach(o=>o.r.cells[d]='PS');
-    take(needS-nPS,o=>cnt(o.r.cells,'S')*3 + pointsOf(o.r.cells) + jitter(o.i)).forEach(o=>o.r.cells[d]='S');
-    take(needP-nPS,o=>cnt(o.r.cells,'P')*3 + pointsOf(o.r.cells) + jitter(o.i)).forEach(o=>o.r.cells[d]='P');
+    // 2) Pagi, Sore, dan PS dari tenaga yang tersedia. Bila tenaga kurang, sebagian jadi PS
+    //    (satu orang menutup Pagi dan Sore). PS jatuh ke perawat dengan PS paling sedikit.
+    //    Bila masih kurang, tahap berikutnya melonggarkan batas, memilih yang harinya paling pendek.
+    for(let ti=0; ti<TIERS.length; ti++){
+      const t=TIERS[ti];
+      const covP = rows.filter(r=>r.cells[d]==='P'||r.cells[d]==='PS').length;
+      const covS = rows.filter(r=>r.cells[d]==='S'||r.cells[d]==='PS').length;
+      const needP = Math.max(0,(req.P||0)-covP), needS = Math.max(0,(req.S||0)-covS);
+      if(!needP && !needS) break;
+      const pool = rows.map((r,i)=>({r,i})).filter(o=>free(o.r,'P',t));
+      if(!pool.length) continue;
+      const pen = o => ti ? run(o.r)*2 : 0;
+      const deficit = needP + needS - pool.length;
+      const nPS = deficit>0 ? Math.min(needP,needS,deficit) : 0;
+      const take = (k,score)=>{ pool.forEach(o=>o.score=score(o)); pool.sort((p,q)=>p.score-q.score); return pool.splice(0,Math.max(0,Math.min(k,pool.length))); };
+      take(nPS,o=>cnt(o.r.cells,'PS')*10 + (prev(o.r)==='PS'?25:0) + pointsOf(o.r.cells)*0.2 + jitter(o.i) + pen(o)).forEach(o=>o.r.cells[d]='PS');
+      take(needS-nPS,o=>cnt(o.r.cells,'S')*3 + pointsOf(o.r.cells) + jitter(o.i) + pen(o)).forEach(o=>o.r.cells[d]='S');
+      take(needP-nPS,o=>cnt(o.r.cells,'P')*3 + pointsOf(o.r.cells) + jitter(o.i) + pen(o)).forEach(o=>o.r.cells[d]='P');
+    }
     // 3) Sisanya: Libur, atau Pagi tambahan bila masih di bawah tempo kerja bulanan
     rows.forEach(r=>{
       if(r.cells[d]!=='') return;
-      if(prev(r)==='M' || run(r)>=MAX_RUN){ r.cells[d]='L'; return; }
+      if(prev(r)==='M' || run(r)>=R){ r.cells[d]='L'; return; }
       const worked = r.cells.slice(0,d).filter(isWork).length;
       const expected = target*d/n;
       const slack = isWeekend(y,m,d+1) ? 2 : 0;
@@ -437,7 +454,7 @@ function autoFill(rows, n, y, m, need, cfg){
           for(let d=0; d<n; d++){
             if(A.r.cells[d]!=='PS' || orig[A.i][d]!=='' || orig[B.i][d]!=='' || B.r.cells[d]!=='L') continue;
             if(d>0 && B.r.cells[d-1]==='M') continue;
-            if(runThrough(B.r.cells,d) > MAX_RUN) continue;
+            if(runThrough(B.r.cells,d) > R) continue;
             A.r.cells[d]='L'; B.r.cells[d]='PS'; done=true; break outer;
           }
         }
@@ -574,10 +591,11 @@ function renderPanels(){
   const cfg=CFG();
   const rules=[];
   if(cfg.cover.includes('M')){ rules.push('Dinas Malam tidak langsung disusul Pagi, Sore, atau PS.'); }
-  rules.push(`Maksimal ${MAX_RUN} hari kerja berturut-turut.`);
+  rules.push(`Maksimal ${cfg.maxRun} hari kerja berturut-turut${cfg.maxRun>=6?' (libur cukup sekali dalam seminggu)':''}.`);
   if(cfg.cover.includes('M')) rules.push(`Maksimal ${MAX_NIGHT} dinas Malam berturut-turut.`);
   rules.push('Jumlah perawat tiap dinas minimal sesuai kebutuhan. PS dihitung untuk Pagi dan Sore sekaligus.');
   rules.push('Kekurangan ditutup dengan PS dari tenaga yang ada. Jumlah PS antarperawat tidak selisih lebih dari 1 kali per bulan.');
+  rules.push('Bila tenaga tetap kurang, batas hari berturut-turut dilonggarkan seperlunya dan ditandai merah di jadwal.');
   $('ruleslist').innerHTML=rules.map(r=>`<li>${r}</li>`).join('');
   $('nurselist').innerHTML=U().nurses.map(nu=>`<li><input class="field nm-in" data-nname="${nu.id}" value="${esc(nu.name)}" maxlength="40" aria-label="Nama perawat">
     <select class="field" data-ngrade="${nu.id}" aria-label="Jenjang ${esc(nu.name)}">${GRADES.map(g=>`<option${g===nu.grade?' selected':''}>${g}</option>`).join('')}</select>
@@ -607,6 +625,7 @@ function runAuto(mode){
   autoFill(rows,n,y,m,U().need,CFG()); saveRows(y,m,rows); refresh();
   const lacking=['P','S','M'].some(k=>A.short[k].length);
   status(lacking?'Jadwal terisi dan PS sudah dipakai, tetapi tenaga belum cukup untuk kebutuhan minimal di sebagian hari. Tambah perawat atau turunkan kebutuhan minimal.'
+    :A.msgs.some(x=>x.type==='Beban'||x.type==='Istirahat')?'Semua kebutuhan terpenuhi. Agar tidak ada kekurangan, sebagian perawat dijadwalkan melewati batas hari berturut-turut. Lihat bagian Pemeriksaan.'
     :A.msgs.length?`Jadwal terisi. Ada ${A.msgs.length} hal yang perlu dicek di bagian Pemeriksaan.`:'Jadwal terisi dan semua aturan terpenuhi.');
 }
 function copyTable(){

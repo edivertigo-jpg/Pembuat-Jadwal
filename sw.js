@@ -1,6 +1,6 @@
 /* Service worker Jadwal Dinas Perawat.
    Naikkan VERSION setiap kali index.html diubah supaya perangkat memuat versi baru. */
-const VERSION = 'v4';
+const VERSION = 'v5';
 const CACHE = 'jadwal-dinas-' + VERSION;
 const SHELL = [
   './',
